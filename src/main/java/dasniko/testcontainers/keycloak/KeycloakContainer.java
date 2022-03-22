@@ -1,32 +1,57 @@
+/*
+ * Copyright (c) 2021 Niko Köbler
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 package dasniko.testcontainers.keycloak;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.dockerjava.api.command.InspectContainerResponse;
-import org.testcontainers.containers.BindMode;
+import org.jboss.shrinkwrap.api.ShrinkWrap;
+import org.jboss.shrinkwrap.api.exporter.ZipExporter;
+import org.jboss.shrinkwrap.api.importer.ExplodedImporter;
+import org.jboss.shrinkwrap.api.spec.JavaArchive;
+import org.keycloak.admin.client.Keycloak;
+import org.keycloak.representations.idm.RealmRepresentation;
 import org.testcontainers.containers.GenericContainer;
-import org.testcontainers.containers.SelinuxContext;
+import org.testcontainers.containers.output.Slf4jLogConsumer;
 import org.testcontainers.containers.wait.strategy.Wait;
-import org.testcontainers.containers.wait.strategy.WaitAllStrategy;
-import org.testcontainers.containers.wait.strategy.WaitStrategy;
-import org.testcontainers.images.builder.Transferable;
 import org.testcontainers.utility.MountableFile;
 
 import java.io.File;
-import java.nio.charset.StandardCharsets;
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.file.Files;
+import java.nio.file.Paths;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
-import java.util.Objects;
 import java.util.Set;
+
+import static java.util.Objects.requireNonNull;
 
 /**
  * @author Niko Köbler, https://www.n-k.de, @dasniko
  */
 public class KeycloakContainer extends GenericContainer<KeycloakContainer> {
 
+    public static final String MASTER_REALM = "master";
+    public static final String ADMIN_CLI_CLIENT = "admin-cli";
+
     private static final String KEYCLOAK_IMAGE = "quay.io/keycloak/keycloak";
-    private static final String KEYCLOAK_VERSION = "15.0.2";
+    private static final String KEYCLOAK_VERSION = "17.0.0";
 
     private static final int KEYCLOAK_PORT_HTTP = 8080;
     private static final int KEYCLOAK_PORT_HTTPS = 8443;
@@ -34,34 +59,35 @@ public class KeycloakContainer extends GenericContainer<KeycloakContainer> {
 
     private static final String KEYCLOAK_ADMIN_USER = "admin";
     private static final String KEYCLOAK_ADMIN_PASSWORD = "admin";
-    private static final String KEYCLOAK_AUTH_PATH = "/auth";
+    private static final String KEYCLOAK_CONTEXT_PATH = "/";
 
-    private static final String DB_VENDOR = "h2";
+    private static final String DEFAULT_KEYCLOAK_PROVIDERS_NAME = "providers.jar";
+    private static final String DEFAULT_KEYCLOAK_PROVIDERS_LOCATION = "/opt/keycloak/providers";
 
-    private static final String DEFAULT_EXTENSION_NAME = "extensions.jar";
-    private static final String DEFAULT_PROVIDERS_NAME = "providers.jar";
-
-    // for Keycloak-X this will be /opt/jboss/keycloak/providers
-    private static final String DEFAULT_KEYCLOAK_DEPLOYMENTS_LOCATION = "/opt/jboss/keycloak/standalone/deployments";
-    private static final String DEFAULT_KEYCLOAK_PROVIDERS_LOCATION = "/opt/jboss/keycloak/providers";
+    private static final String KEYSTORE_FILE_IN_CONTAINER = "/opt/keycloak/conf/server.keystore";
 
     private String adminUsername = KEYCLOAK_ADMIN_USER;
     private String adminPassword = KEYCLOAK_ADMIN_PASSWORD;
+    private String contextPath = KEYCLOAK_CONTEXT_PATH;
 
-    private String dbVendor = DB_VENDOR;
-    private Set<String> importFiles;
-    private String tlsCertFilename;
-    private String tlsKeyFilename;
+    private final Set<String> importFiles;
+    private String tlsCertificateFilename;
+    private String tlsCertificateKeyFilename;
+    private String tlsKeystoreFilename;
+    private String tlsKeystorePassword;
     private boolean useTls = false;
+
+    private String[] featuresEnabled = null;
+    private String[] featuresDisabled = null;
 
     private Duration startupTimeout = DEFAULT_STARTUP_TIMEOUT;
 
-    private String extensionClassLocation;
     private String providerClassLocation;
+    private List<File> providerLibsLocations;
 
-    private static final Transferable WILDFLY_DEPLOYMENT_TRIGGER_FILE_CONTENT = Transferable.of("true".getBytes(StandardCharsets.UTF_8));
-    private final Set<String> wildflyDeploymentTriggerFiles = new HashSet<>();
-
+    /**
+     * Create a KeycloakContainer with default image and version tag
+     */
     public KeycloakContainer() {
         this(KEYCLOAK_IMAGE + ":" + KEYCLOAK_VERSION);
     }
@@ -69,68 +95,103 @@ public class KeycloakContainer extends GenericContainer<KeycloakContainer> {
     /**
      * Create a KeycloakContainer by passing the full docker image name
      *
-     * @param dockerImageName Full docker image name, e.g. quay.io/keycloak/keycloak:8.0.1
+     * @param dockerImageName Full docker image name, e.g. quay.io/keycloak/keycloak:17.0.0
      */
     public KeycloakContainer(String dockerImageName) {
         super(dockerImageName);
         withExposedPorts(KEYCLOAK_PORT_HTTP, KEYCLOAK_PORT_HTTPS);
         importFiles = new HashSet<>();
-//        withLogConsumer(new Slf4jLogConsumer(logger()));
+        withLogConsumer(new Slf4jLogConsumer(logger()));
     }
 
     @Override
     protected void configure() {
-        withCommand(
-            "-c standalone.xml", // don't start infinispan cluster
-            "-b 0.0.0.0", // ensure proper binding
-            "-Dkeycloak.profile.feature.upload_scripts=enabled" // enable script uploads
-        );
+        List<String> commandParts = new ArrayList<>();
+        commandParts.add("start");
+        commandParts.add("--auto-build");
+        commandParts.add("--cache=local");
+        commandParts.add("--http-enabled=true");
+        commandParts.add("--hostname-strict=false");
+        commandParts.add("--hostname-strict-https=false");
+
+        if (!contextPath.equals(KEYCLOAK_CONTEXT_PATH)) {
+            commandParts.add("--http-relative-path=" + contextPath);
+        }
+
+        if (featuresEnabled != null) {
+            commandParts.add("--features=" + String.join(",", featuresEnabled));
+        }
+
+        if (featuresDisabled != null) {
+            commandParts.add("--features-disabled=" + String.join(",", featuresDisabled));
+        }
 
         setWaitStrategy(Wait
-            .forHttp(KEYCLOAK_AUTH_PATH)
+            .forHttp(contextPath)
             .forPort(KEYCLOAK_PORT_HTTP)
             .withStartupTimeout(startupTimeout)
         );
 
-        withEnv("KEYCLOAK_USER", adminUsername);
-        withEnv("KEYCLOAK_PASSWORD", adminPassword);
+        withEnv("KEYCLOAK_ADMIN", adminUsername);
+        withEnv("KEYCLOAK_ADMIN_PASSWORD", adminPassword);
 
-        withEnv("DB_VENDOR", dbVendor);
-
-        if (useTls && isNotBlank(tlsCertFilename) && isNotBlank(tlsKeyFilename)) {
-            String certFileInContainer = "/etc/x509/https/tls.crt";
-            String keyFileInContainer = "/etc/x509/https/tls.key";
-            withCopyFileToContainer(MountableFile.forClasspathResource(tlsCertFilename), certFileInContainer);
-            withCopyFileToContainer(MountableFile.forClasspathResource(tlsKeyFilename), keyFileInContainer);
-        }
-
-        List<String> filesInContainer = new ArrayList<>();
-        for (String importFile : importFiles) {
-            String importFileInContainer = "/tmp/" + importFile;
-            filesInContainer.add(importFileInContainer);
-            withCopyFileToContainer(MountableFile.forClasspathResource(importFile), importFileInContainer);
-        }
-
-        if (!importFiles.isEmpty()) {
-            withEnv("KEYCLOAK_IMPORT", String.join(",", filesInContainer));
-        }
-
-        if (extensionClassLocation != null) {
-            createKeycloakExtensionDeployment(extensionClassLocation);
+        if (useTls && isNotBlank(tlsCertificateFilename)) {
+            String tlsCertFilePath = "/opt/keycloak/conf/tls.crt";
+            String tlsCertKeyFilePath = "/opt/keycloak/conf/tls.key";
+            withCopyFileToContainer(MountableFile.forClasspathResource(tlsCertificateFilename), tlsCertFilePath);
+            withCopyFileToContainer(MountableFile.forClasspathResource(tlsCertificateKeyFilename), tlsCertKeyFilePath);
+            commandParts.add("--https-certificate-file=" + tlsCertFilePath);
+            commandParts.add("--https-certificate-key-file=" + tlsCertKeyFilePath);
+        } else if (useTls && isNotBlank(tlsKeystoreFilename)) {
+            withCopyFileToContainer(MountableFile.forClasspathResource(tlsKeystoreFilename), KEYSTORE_FILE_IN_CONTAINER);
+            commandParts.add("--https-key-store-file=" + KEYSTORE_FILE_IN_CONTAINER);
+            commandParts.add("--https-key-store-password=" + tlsKeystorePassword);
         }
 
         if (providerClassLocation != null) {
             createKeycloakExtensionProvider(providerClassLocation);
         }
+
+        if (providerLibsLocations != null) {
+            providerLibsLocations.forEach(file -> {
+                String containerPath = DEFAULT_KEYCLOAK_PROVIDERS_LOCATION + "/" + file.getName();
+                withCopyFileToContainer(MountableFile.forHostPath(file.getAbsolutePath()), containerPath);
+            });
+        }
+
+        setCommand(commandParts.toArray(new String[0]));
     }
 
-    /**
-     * Maps the provided {@code extensionClassFolder} as an exploded extension.jar to the Keycloak deployments folder.
-     *
-     * @param extensionClassFolder a path relative to the current classpath root.
-     */
-    public void createKeycloakExtensionDeployment(String extensionClassFolder) {
-        createKeycloakExtensionDeployment(DEFAULT_KEYCLOAK_DEPLOYMENTS_LOCATION, DEFAULT_EXTENSION_NAME, extensionClassFolder);
+    @Override
+    public KeycloakContainer withCommand(String cmd) {
+        throw new IllegalStateException("You are trying to set custom container commands, which is currently not supported by this Testcontainer.");
+    }
+
+    @Override
+    public KeycloakContainer withCommand(String... commandParts) {
+        throw new IllegalStateException("You are trying to set custom container commands, which is currently not supported by this Testcontainer.");
+    }
+
+    @Override
+    protected void containerIsStarted(InspectContainerResponse containerInfo, boolean reused) {
+        if (reused) {
+            logger().info("This container is being reused, so we're skipping the realm import.");
+            return;
+        }
+        if (!importFiles.isEmpty()) {
+            logger().info("Connect to Keycloak container to import given realm files.");
+            Keycloak kcAdmin = getKeycloakAdminClient();
+            try {
+                for (String importFile : importFiles) {
+                    logger().info("Importing realm from file {}", importFile);
+                    kcAdmin.realms().create(
+                        new ObjectMapper().readValue(this.getClass().getResource(importFile), RealmRepresentation.class)
+                    );
+                }
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
+            }
+        }
     }
 
     /**
@@ -139,7 +200,7 @@ public class KeycloakContainer extends GenericContainer<KeycloakContainer> {
      * @param extensionClassFolder a path relative to the current classpath root.
      */
     public void createKeycloakExtensionProvider(String extensionClassFolder) {
-        createKeycloakExtensionDeployment(DEFAULT_KEYCLOAK_PROVIDERS_LOCATION, DEFAULT_EXTENSION_NAME, extensionClassFolder);
+        createKeycloakExtensionDeployment(DEFAULT_KEYCLOAK_PROVIDERS_LOCATION, DEFAULT_KEYCLOAK_PROVIDERS_NAME, extensionClassFolder);
     }
 
     /**
@@ -151,79 +212,36 @@ public class KeycloakContainer extends GenericContainer<KeycloakContainer> {
      */
     protected void createKeycloakExtensionDeployment(String deploymentLocation, String extensionName, String extensionClassFolder) {
 
-        Objects.requireNonNull(deploymentLocation, "deploymentLocation");
-        Objects.requireNonNull(extensionName, "extensionName");
-        Objects.requireNonNull(extensionClassFolder, "extensionClassFolder");
+        requireNonNull(deploymentLocation, "deploymentLocation must not be null");
+        requireNonNull(extensionName, "extensionName must not be null");
+        requireNonNull(extensionClassFolder, "extensionClassFolder must not be null");
 
         String classesLocation = resolveExtensionClassLocation(extensionClassFolder);
-
-        if (!new File(classesLocation).exists()) {
-            return;
+        if (new File(classesLocation).exists()) {
+            final File file;
+            try {
+                file = Files.createTempFile("keycloak", ".jar").toFile();
+                file.setReadable(true, false);
+                file.deleteOnExit();
+                ShrinkWrap.create(JavaArchive.class, extensionName)
+                    .as(ExplodedImporter.class)
+                    .importDirectory(classesLocation)
+                    .as(ZipExporter.class)
+                    .exportTo(file, true);
+                withCopyFileToContainer(MountableFile.forHostPath(file.getAbsolutePath()), deploymentLocation + "/" + extensionName);
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
+            }
         }
 
-        String explodedFolderName = extensionClassFolder.hashCode() + "-" + extensionName;
-        String explodedFolderExtensionsJar = deploymentLocation + "/" + explodedFolderName;
-        addFileSystemBind(classesLocation, explodedFolderExtensionsJar, BindMode.READ_WRITE, SelinuxContext.SINGLE);
-
-        boolean wildflyDeployment = deploymentLocation.contains("/standalone/deployments");
-        if (wildflyDeployment) {
-            registerWildflyDeploymentTriggerFile(deploymentLocation, explodedFolderName);
-
-            // wait for extension deployment
-            setWaitStrategy(createCombinedWaitAllStrategy(Wait.forLogMessage(".* Deployed \"" + explodedFolderName + "\" .*", 1)));
-        }
-    }
-
-    /**
-     * Creates a {@link WaitAllStrategy} based on the current {@link #getWaitStrategy()} if present followed by the given {@link WaitStrategy}.
-     * @param waitStrategy
-     * @return
-     */
-    private WaitAllStrategy createCombinedWaitAllStrategy(WaitStrategy waitStrategy) {
-        WaitAllStrategy waitAll = new WaitAllStrategy();
-        // startup timeout needs to be configured before calling .withStrategy(..) due to implementation in testcontainers.
-        waitAll.withStartupTimeout(startupTimeout);
-        WaitStrategy currentWaitStrategy = getWaitStrategy();
-        if (currentWaitStrategy != null) {
-            waitAll.withStrategy(currentWaitStrategy);
-        }
-        waitAll.withStrategy(waitStrategy);
-        return waitAll;
-    }
-
-    /**
-     * Registers a {@code extensions.jar.dodeploy} file to be created at container startup.
-     *
-     * @param deploymentLocation
-     * @param extensionArtifact
-     */
-    private void registerWildflyDeploymentTriggerFile(String deploymentLocation, String extensionArtifact) {
-        String triggerFileName = extensionArtifact + ".dodeploy";
-        wildflyDeploymentTriggerFiles.add(deploymentLocation + "/" + triggerFileName);
-    }
-
-    @Override
-    protected void containerIsStarting(InspectContainerResponse containerInfo) {
-        createWildflyDeploymentTriggerFiles();
-    }
-
-    @Override
-    protected void containerIsStopping(InspectContainerResponse containerInfo) {
-        wildflyDeploymentTriggerFiles.clear();
-    }
-
-    /**
-     * Creates a new Wildfly {@code extensions.jar.dodeploy} deployment trigger file to ensure the exploded extension
-     * folder is deployed on container startup.
-     */
-    private void createWildflyDeploymentTriggerFiles() {
-        wildflyDeploymentTriggerFiles.forEach(deploymentTriggerFile ->
-            copyFileToContainer(WILDFLY_DEPLOYMENT_TRIGGER_FILE_CONTENT, deploymentTriggerFile));
     }
 
     protected String resolveExtensionClassLocation(String extensionClassFolder) {
-        String moduleFolder = MountableFile.forClasspathResource(".").getResolvedPath() + "/../../";
-        return moduleFolder + extensionClassFolder;
+        return Paths.get(MountableFile.forClasspathResource(".").getResolvedPath())
+            .getParent()
+            .getParent()
+            .resolve(extensionClassFolder)
+            .toString();
     }
 
     public KeycloakContainer withRealmImportFile(String importFile) {
@@ -246,25 +264,8 @@ public class KeycloakContainer extends GenericContainer<KeycloakContainer> {
         return self();
     }
 
-    /**
-     * @deprecated This method will be removed in next major version of this project,
-     * as it doesn't make much sense in testing environment to use some other stateful system,
-     * as tests should be independend from other environment.
-     * Also, this option was never officially documented and only here for internal meanings.
-     */
-    @Deprecated
-    public KeycloakContainer withDbVendor(String dbVendor) {
-        this.dbVendor = dbVendor;
-        return self();
-    }
-
-    /**
-     * Exposes the given classes location as an exploded extension.jar.
-     *
-     * @param classesLocation a classes location relative to the current classpath root.
-     */
-    public KeycloakContainer withExtensionClassesFrom(String classesLocation) {
-        this.extensionClassLocation = classesLocation;
+    public KeycloakContainer withContextPath(String contextPath) {
+        this.contextPath = contextPath;
         return self();
     }
 
@@ -278,9 +279,9 @@ public class KeycloakContainer extends GenericContainer<KeycloakContainer> {
         return self();
     }
 
-    public KeycloakContainer useTls() {
-        // tls.crt and tls.key are provided with this testcontainer
-        return useTls("tls.crt", "tls.key");
+    public KeycloakContainer withProviderLibsFrom(List<File> libs) {
+        this.providerLibsLocations = libs;
+        return self();
     }
 
     public KeycloakContainer withStartupTimeout(Duration startupTimeout) {
@@ -288,16 +289,46 @@ public class KeycloakContainer extends GenericContainer<KeycloakContainer> {
         return self();
     }
 
-    public KeycloakContainer useTls(String tlsCertFilename, String tlsKeyFilename) {
-        this.tlsCertFilename = tlsCertFilename;
-        this.tlsKeyFilename = tlsKeyFilename;
+    public KeycloakContainer useTls() {
+        // server.keystore is provided with this testcontainer
+        return useTlsKeystore("tls.jks", "changeit");
+    }
+
+    public KeycloakContainer useTls(String tlsCertificateFilename, String tlsCertificateKeyFilename) {
+        requireNonNull(tlsCertificateFilename, "tlsCertificateFilename must not be null");
+        requireNonNull(tlsCertificateKeyFilename, "tlsCertificateKeyFilename must not be null");
+        this.tlsCertificateFilename = tlsCertificateFilename;
+        this.tlsCertificateKeyFilename = tlsCertificateKeyFilename;
         this.useTls = true;
         return self();
     }
 
+    public KeycloakContainer useTlsKeystore(String tlsKeystoreFilename, String tlsKeystorePassword) {
+        requireNonNull(tlsKeystoreFilename, "tlsKeystoreFilename must not be null");
+        requireNonNull(tlsKeystorePassword, "tlsKeystorePassword must not be null");
+        this.tlsKeystoreFilename = tlsKeystoreFilename;
+        this.tlsKeystorePassword = tlsKeystorePassword;
+        this.useTls = true;
+        return self();
+    }
+
+    public KeycloakContainer withFeaturesEnabled(String... features) {
+        this.featuresEnabled = features;
+        return self();
+    }
+
+    public KeycloakContainer withFeaturesDisabled(String... features) {
+        this.featuresDisabled = features;
+        return self();
+    }
+
+    public Keycloak getKeycloakAdminClient() {
+        return Keycloak.getInstance(getAuthServerUrl(), MASTER_REALM, getAdminUsername(), getAdminPassword(), ADMIN_CLI_CLIENT);
+    }
+
     public String getAuthServerUrl() {
         return String.format("http%s://%s:%s%s", useTls ? "s" : "", getContainerIpAddress(),
-            useTls ? getMappedPort(KEYCLOAK_PORT_HTTPS) : getMappedPort(KEYCLOAK_PORT_HTTP), KEYCLOAK_AUTH_PATH);
+            useTls ? getHttpsPort() : getHttpPort(), getContextPath());
     }
 
     public String getAdminUsername() {
@@ -314,6 +345,10 @@ public class KeycloakContainer extends GenericContainer<KeycloakContainer> {
 
     public int getHttpsPort() {
         return getMappedPort(KEYCLOAK_PORT_HTTPS);
+    }
+
+    public String getContextPath() {
+        return contextPath;
     }
 
     public Duration getStartupTimeout() {

@@ -1,9 +1,9 @@
 package dasniko.testcontainers.keycloak;
 
 import dasniko.testcontainers.keycloak.extensions.oidcmapper.TestOidcProtocolMapper;
-import org.junit.AfterClass;
-import org.junit.BeforeClass;
-import org.junit.Test;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
 import org.keycloak.TokenVerifier;
 import org.keycloak.admin.client.Keycloak;
 import org.keycloak.admin.client.resource.RealmResource;
@@ -11,12 +11,10 @@ import org.keycloak.representations.AccessToken;
 import org.keycloak.representations.AccessTokenResponse;
 import org.keycloak.representations.idm.ClientRepresentation;
 
-import static dasniko.testcontainers.keycloak.KeycloakContainerTest.ADMIN_CLI;
-import static dasniko.testcontainers.keycloak.KeycloakContainerTest.MASTER;
 import static dasniko.testcontainers.keycloak.KeycloakContainerTest.TEST_REALM_JSON;
+import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.notNullValue;
 import static org.hamcrest.Matchers.startsWith;
-import static org.junit.Assert.assertThat;
 
 /**
  * Tests reusable containers support for {@link KeycloakContainer}.
@@ -26,24 +24,23 @@ public class KeycloakContainerExtensionReuseTest {
     public static final KeycloakContainer KEYCLOAK = new KeycloakContainer()
         .withRealmImportFile(TEST_REALM_JSON)
         // this would normally be just "target/classes"
-        .withExtensionClassesFrom("target/test-classes")
+        .withProviderClassesFrom("target/test-classes")
         // this enables KeycloakContainer reuse across tests
         .withReuse(true);
 
-    @BeforeClass
+    @BeforeAll
     public static void beforeAll() {
         KEYCLOAK.start();
 
-        Keycloak keycloakClient = Keycloak.getInstance(KEYCLOAK.getAuthServerUrl(), MASTER,
-            KEYCLOAK.getAdminUsername(), KEYCLOAK.getAdminPassword(), ADMIN_CLI);
+        Keycloak keycloakClient = KEYCLOAK.getKeycloakAdminClient();
 
-        RealmResource realm = keycloakClient.realm(MASTER);
-        ClientRepresentation client = realm.clients().findByClientId(ADMIN_CLI).get(0);
+        RealmResource realm = keycloakClient.realm(KeycloakContainer.MASTER_REALM);
+        ClientRepresentation client = realm.clients().findByClientId(KeycloakContainer.ADMIN_CLI_CLIENT).get(0);
 
         KeycloakContainerExtensionTest.configureCustomOidcProtocolMapper(realm, client);
     }
 
-    @AfterClass
+    @AfterAll
     public static void afterAll() {
         KEYCLOAK.stop();
     }
@@ -65,8 +62,7 @@ public class KeycloakContainerExtensionReuseTest {
 
     private void simpleOidcProtocolMapperTest() throws Exception {
 
-        Keycloak keycloakClient = Keycloak.getInstance(KEYCLOAK.getAuthServerUrl(), MASTER,
-            KEYCLOAK.getAdminUsername(), KEYCLOAK.getAdminPassword(), ADMIN_CLI);
+        Keycloak keycloakClient = KEYCLOAK.getKeycloakAdminClient();
 
         keycloakClient.tokenManager().grantToken();
 

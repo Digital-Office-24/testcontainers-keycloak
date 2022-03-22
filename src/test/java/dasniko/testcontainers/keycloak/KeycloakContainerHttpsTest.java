@@ -2,38 +2,41 @@ package dasniko.testcontainers.keycloak;
 
 import io.restassured.RestAssured;
 import io.restassured.config.SSLConfig;
-import org.junit.Before;
-import org.junit.Test;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
 
 import static io.restassured.RestAssured.given;
+import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.startsWith;
-import static org.junit.Assert.assertThat;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /**
  * @author Niko Köbler, https://www.n-k.de, @dasniko
  */
 public class KeycloakContainerHttpsTest {
 
-    @Before
+    @BeforeEach
     public void setup() {
         RestAssured.reset();
     }
 
     @Test
-    public void shouldStartKeycloakWithDefaultTlsSupport() {
-        try (KeycloakContainer keycloak = new KeycloakContainer()) {
+    public void shouldStartKeycloakWithTlsSupport() {
+        try (KeycloakContainer keycloak = new KeycloakContainer().useTls()) {
             keycloak.start();
 
             RestAssured.useRelaxedHTTPSValidation();
 
+            assertThat(keycloak.getAuthServerUrl(), startsWith("https://"));
+
             given()
-                .when().get("https://localhost:" + keycloak.getHttpsPort() + "/auth")
+                .when().get(keycloak.getAuthServerUrl())
                 .then().statusCode(200);
         }
     }
 
     @Test
-    public void shouldStartKeycloakWithProvidedTlsCertAndKey() {
+    public void shouldStartKeycloakWithProvidedTlsKeystore() {
         try (KeycloakContainer keycloak = new KeycloakContainer().useTls()) {
             keycloak.start();
             checkTls(keycloak, "tls.jks", "changeit");
@@ -44,8 +47,26 @@ public class KeycloakContainerHttpsTest {
     public void shouldStartKeycloakWithCustomTlsCertAndKey() {
         try (KeycloakContainer keycloak = new KeycloakContainer().useTls("keycloak.crt", "keycloak.key")) {
             keycloak.start();
-            checkTls(keycloak,"keycloak.jks", "keycloak");
+            checkTls(keycloak, "keycloak.jks", "keycloak");
         }
+    }
+
+    @Test
+    public void shouldStartKeycloakWithCustomTlsKeystore() {
+        try (KeycloakContainer keycloak = new KeycloakContainer().useTlsKeystore("keycloak.jks", "keycloak")) {
+            keycloak.start();
+            checkTls(keycloak, "keycloak.jks", "keycloak");
+        }
+    }
+
+    @Test
+    public void shouldThrowNullPointerExceptionUponNullTlsCertificateKeyFilename() {
+        assertThrows(NullPointerException.class, () -> new KeycloakContainer().useTls("keycloak.crt", null));
+    }
+
+    @Test
+    public void shouldThrowNullPointerExceptionUponNullTlsKeystore() {
+        assertThrows(NullPointerException.class, () -> new KeycloakContainer().useTlsKeystore("keycloak.jks", null));
     }
 
     private void checkTls(KeycloakContainer keycloak, String pathToTruststore, String truststorePassword) {

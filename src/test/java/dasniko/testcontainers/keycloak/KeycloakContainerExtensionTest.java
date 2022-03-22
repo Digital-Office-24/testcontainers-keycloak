@@ -3,7 +3,8 @@ package dasniko.testcontainers.keycloak;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dasniko.testcontainers.keycloak.extensions.oidcmapper.TestOidcProtocolMapper;
-import org.junit.Test;
+import org.jboss.shrinkwrap.resolver.api.maven.Maven;
+import org.junit.jupiter.api.Test;
 import org.keycloak.TokenVerifier;
 import org.keycloak.admin.client.Keycloak;
 import org.keycloak.admin.client.resource.RealmResource;
@@ -14,59 +15,46 @@ import org.keycloak.representations.AccessTokenResponse;
 import org.keycloak.representations.idm.ClientRepresentation;
 import org.keycloak.representations.idm.ProtocolMapperRepresentation;
 
+import java.io.File;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
-import java.util.function.Function;
 
-import static dasniko.testcontainers.keycloak.KeycloakContainerTest.ADMIN_CLI;
-import static dasniko.testcontainers.keycloak.KeycloakContainerTest.MASTER;
 import static dasniko.testcontainers.keycloak.KeycloakContainerTest.TEST_REALM_JSON;
+import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.emptyOrNullString;
 import static org.hamcrest.Matchers.is;
+import static org.hamcrest.Matchers.not;
 import static org.hamcrest.Matchers.notNullValue;
 import static org.hamcrest.Matchers.startsWith;
-import static org.junit.Assert.assertThat;
 
 public class KeycloakContainerExtensionTest {
 
     @Test
     public void shouldStartKeycloakWithNonExistingExtensionClassFolder() {
         try (KeycloakContainer keycloak = new KeycloakContainer()
-            .withExtensionClassesFrom("target/does_not_exist")) {
+            .withProviderClassesFrom("target/does_not_exist")) {
             keycloak.start();
         }
     }
 
     /**
-     * Deploys the Keycloak extensions from the test-classes folder into the create Keycloak container.
-     *
-     * @throws Exception
+     * Deploys the Keycloak extensions from the test-classes folder into the created Keycloak container.
      */
     @Test
-    public void shouldDeployExtension() throws Exception {
-        shouldDeploy(kc ->
-            // this would normally be just "target/classes"
-            kc.withExtensionClassesFrom("target/test-classes"));
-    }
-
-    @Test
     public void shouldDeployProvider() throws Exception {
-        shouldDeploy(kc ->
+        try (KeycloakContainer keycloak = new KeycloakContainer()
             // this would normally be just "target/classes"
-            kc.withProviderClassesFrom("target/test-classes"));
-    }
-
-    private void shouldDeploy(Function<KeycloakContainer, KeycloakContainer> configurator) throws Exception {
-        try (KeycloakContainer keycloak = configurator.apply(new KeycloakContainer())
+            .withProviderClassesFrom("target/test-classes")
             .withRealmImportFile(TEST_REALM_JSON)) {
             keycloak.start();
 
-            Keycloak keycloakClient = Keycloak.getInstance(keycloak.getAuthServerUrl(), MASTER,
-                keycloak.getAdminUsername(), keycloak.getAdminPassword(), ADMIN_CLI);
+            Keycloak keycloakClient = keycloak.getKeycloakAdminClient();
 
-            RealmResource realm = keycloakClient.realm(MASTER);
-            ClientRepresentation client = realm.clients().findByClientId(ADMIN_CLI).get(0);
+            RealmResource realm = keycloakClient.realm(KeycloakContainer.MASTER_REALM);
+            ClientRepresentation client = realm.clients().findByClientId(KeycloakContainer.ADMIN_CLI_CLIENT).get(0);
 
             configureCustomOidcProtocolMapper(realm, client);
 
@@ -87,52 +75,57 @@ public class KeycloakContainerExtensionTest {
     }
 
     @Test
-    public void shouldDeployExtensionAndCallCustomEndpoint() throws Exception {
-        shouldDeployAndCallCustomEndpoint(kc ->
-                // this would normally be just "target/classes"
-                kc.withExtensionClassesFrom("target/test-classes")
-            );
-    }
-
-    @Test
     public void shouldDeployProviderAndCallCustomEndpoint() throws Exception {
-        shouldDeployAndCallCustomEndpoint(kc ->
+        try (KeycloakContainer keycloak = new KeycloakContainer()
             // this would normally be just "target/classes"
-            kc.withExtensionClassesFrom("target/test-classes")
-        );
-    }
-
-    private void shouldDeployAndCallCustomEndpoint(Function<KeycloakContainer, KeycloakContainer> configurator) throws Exception {
-        try (KeycloakContainer keycloak = configurator.apply(new KeycloakContainer())) {
+            .withProviderClassesFrom("target/test-classes")) {
             keycloak.start();
 
             ObjectMapper objectMapper = new ObjectMapper();
-            String uri = keycloak.getAuthServerUrl() + "/realms/master/test-resource/hello";
+            String uri = keycloak.getAuthServerUrl() + "realms/master/test-resource/hello";
 
             // test the "public" endpoint
-            Map<String, String> result = objectMapper.readValue(new URL(uri), new TypeReference<Map<String, String>>() {});
+            Map<String, String> result = objectMapper.readValue(new URL(uri), new TypeReference<>() {});
             assertThat(result.get("hello"), is("master"));
 
             // and now the secured endpoint, first we need a valid token
-            Keycloak keycloakClient = Keycloak.getInstance(keycloak.getAuthServerUrl(), MASTER,
-                keycloak.getAdminUsername(), keycloak.getAdminPassword(), ADMIN_CLI);
+            Keycloak keycloakClient = keycloak.getKeycloakAdminClient();
             AccessTokenResponse accessTokenResponse = keycloakClient.tokenManager().getAccessToken();
 
-            URL url = new URL(keycloak.getAuthServerUrl() + "/realms/master/test-resource/hello-auth");
+            URL url = new URL(keycloak.getAuthServerUrl() + "realms/master/test-resource/hello-auth");
             HttpURLConnection conn = (HttpURLConnection) url.openConnection();
             conn.setRequestMethod("GET");
             conn.setRequestProperty("Authorization", "Bearer " + accessTokenResponse.getToken());
 
-            Map<String, String> authResult = objectMapper.readValue(conn.getInputStream(), new TypeReference<Map<String, String>>() {});
+            Map<String, String> authResult = objectMapper.readValue(conn.getInputStream(), new TypeReference<>() {});
             assertThat(authResult.get("hello"), is("admin"));
+        }
+    }
+
+    @Test
+    public void shouldDeployProviderWithDependencyAndCallCustomEndpoint() throws Exception {
+        List<File> dependencies = Maven.resolver()
+            .loadPomFromFile("./pom.xml")
+            .resolve("com.github.javafaker:javafaker")
+            .withoutTransitivity().asList(File.class);
+
+        try (KeycloakContainer keycloak = new KeycloakContainer()
+            .withProviderClassesFrom("target/test-classes")
+            .withProviderLibsFrom(dependencies)) {
+            keycloak.start();
+
+            ObjectMapper objectMapper = new ObjectMapper();
+            String uri = keycloak.getAuthServerUrl() + "realms/master/yoda/quote";
+
+            Map<String, String> result = objectMapper.readValue(new URL(uri), new TypeReference<>() {});
+            String quote = result.get("yoda");
+            assertThat(quote, not(emptyOrNullString()));
+            System.out.printf("Yoda says: %s\n", quote);
         }
     }
 
     /**
      * Configures the {@link TestOidcProtocolMapper} to the given client in the given realm.
-     *
-     * @param realm
-     * @param client
      */
     static void configureCustomOidcProtocolMapper(RealmResource realm, ClientRepresentation client) {
 
